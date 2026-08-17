@@ -1,0 +1,4 @@
+python -m streamlit run app_live.py
+python worker_daemon.py
+cmc aPI - d8744bc164774d9d93abae50faff31ce
+Admin - Bolivia

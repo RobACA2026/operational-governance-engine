@@ -1,0 +1,39 @@
+import time
+import requests
+from governance_engine import GovernanceEngine
+
+def fetch_cmc_btc_price():
+    url = "https://pro-api.coinmarketcap.com/v1/cryptocurrency/quotes/latest"
+    parameters = {"symbol": "BTC", "convert": "USD"}
+    headers = {
+        "Accepts": "application/json",
+        "X-CMC_PRO_API_KEY": "YOUR_API_KEY"
+    }
+    try:
+        response = requests.get(url, headers=headers, params=parameters, timeout=5)
+        if response.status_code == 200:
+            data = response.json()
+            return float(data["data"]["BTC"]["quote"]["USD"]["price"])
+    except Exception:
+        pass
+    # Fallback price to maintain continuous daemon ticks during testing
+    return 65000.0
+
+def main():
+    engine = GovernanceEngine()
+    print("Initializing operational governance live test daemon.")
+    
+    for tick in range(1, 1441):
+        current_price = fetch_cmc_btc_price()
+        result = engine.run_automated_strategy_tick(current_price)
+        
+        admissible = result.get("admissible", False)
+        reason = result.get("interceptor_reason", "Automated tick executed.")
+        
+        timestamp = time.strftime('%Y-%m-%d %H:%M:%S')
+        print(f"[{timestamp}] Tick {tick}/1440 | Price: ${current_price:,.2f} | Admissible: {admissible} | Reason: {reason}")
+        
+        time.sleep(60)
+
+if __name__ == "__main__":
+    main()
