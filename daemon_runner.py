@@ -7,7 +7,7 @@ import requests
 from governance_engine import GovernanceEngine
 
 
-BINANCE_PRICE_URL = "https://api.binance.com/api/v3/ticker/price"
+COINGECKO_PRICE_URL = "https://api.coingecko.com/api/v3/simple/price"
 TICK_SECONDS = 60
 TOTAL_TICKS = 1440
 
@@ -18,20 +18,16 @@ def utc_timestamp() -> str:
     )
 
 
-def fetch_binance_btc_price() -> float:
+def fetch_coingecko_btc_price() -> float:
     response = requests.get(
-        BINANCE_PRICE_URL,
-        params={"symbol": "BTCUSDT"},
+        COINGECKO_PRICE_URL,
+        params={"ids": "bitcoin", "vs_currencies": "usd"},
         timeout=10,
     )
     response.raise_for_status()
 
     data = response.json()
-
-    if data.get("symbol") != "BTCUSDT":
-        raise ValueError(f"Unexpected response: {data}")
-
-    price = float(data["price"])
+    price = float(data["bitcoin"]["usd"])
 
     if price <= 0:
         raise ValueError(f"Invalid price: {price}")
@@ -83,14 +79,14 @@ def main():
         timestamp = utc_timestamp()
 
         try:
-            current_price = fetch_binance_btc_price()
+            current_price = fetch_coingecko_btc_price()
         except Exception as exc:
             error_record = {
                 "timestamp": timestamp,
                 "tick": tick,
                 "status": "DATA_ERROR",
-                "source": "BINANCE",
-                "symbol": "BTCUSDT",
+                "source": "COINGECKO",
+                "symbol": "BTC",
                 "reason": str(exc),
             }
 
@@ -116,8 +112,8 @@ def main():
         record = {
             "timestamp": timestamp,
             "tick": tick,
-            "source": "BINANCE",
-            "symbol": "BTCUSDT",
+            "source": "COINGECKO",
+            "symbol": "BTC",
             "price": current_price,
             "status": result.get("status"),
             "admissible": result.get("admissible"),
