@@ -3,10 +3,9 @@ from __future__ import annotations
 import hashlib
 import json
 import logging
-import os
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Dict, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 import numpy as np
 import pandas as pd
@@ -17,22 +16,28 @@ from governance_engine import GovernanceEngine
 
 
 logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger("operational-governance-app")
+
+logger = logging.getLogger(
+    "operational-governance-app"
+)
 
 
 BASE_DIR = Path(__file__).resolve().parent
 CSV_PATH = BASE_DIR / "btc-usd-max.csv"
 AUDIT_PATH = BASE_DIR / "audit_chain.jsonl"
+UI_AUDIT_PATH = BASE_DIR / "app_governance.jsonl"
 
 COINGECKO_PRICE_URL = (
     "https://api.coingecko.com/api/v3/simple/price"
 )
 
-PRICE_SOURCE_LIVE = "COINGECKO"
-PRICE_SOURCE_FALLBACK = "LAST_SUCCESSFUL_PRICE"
+COINGECKO_SOURCE = "COINGECKO"
+FALLBACK_SOURCE = "LAST_SUCCESSFUL_PRICE"
 PRICE_SYMBOL = "bitcoin"
 
-PRICE_CACHE_TTL_SECONDS = 15
+PRICE_CACHE_TTL_SECONDS = 60
+
+APP_BOOT_MARKER = "app_live.py loaded"
 
 
 def utc_timestamp() -> str:
@@ -45,144 +50,174 @@ def utc_timestamp() -> str:
     ttl=PRICE_CACHE_TTL_SECONDS,
     show_spinner=False,
 )
-def fetch_coingecko_btc_price() -> float:
+def fetch_coingecko_btc_price() -> Tuple[
+    Optional[float],
+    Optional[str],
+]:
     """
-    Fetch the current Bitcoin/USD price from CoinGecko.
+    Return (price, error_message).
 
-    This uses the keyless public API and does not require
-    an API key.
-    """
-
-    response = requests.get(
-        COINGECKO_PRICE_URL,
-        params={
-            "ids": "bitcoin",
-            "vs_currencies": "usd",
-        },
-        headers={
-            "Accept": "application/json",
-            "User-Agent": (
-                "operational-governance-engine/1.0"
-            ),
-        },
-        timeout=10,
-    )
-
-    response.raise_for_status()
-
-    data = response.json()
-
-    if not isinstance(data, dict):
-        raise ValueError(
-            f"Unexpected CoinGecko response: {data}"
-        )
-
-    bitcoin_data = data.get("bitcoin")
-
-    if not isinstance(bitcoin_data, dict):
-        raise ValueError(
-            f"Missing bitcoin data: {data}"
-        )
-
-    if "usd" not in bitcoin_data:
-        raise ValueError(
-            f"Missing USD price: {data}"
-        )
-
-    price = float(bitcoin_data["usd"])
-
-    if not np.isfinite(price) or price <= 0:
-        raise ValueError(
-            f"Invalid CoinGecko price: {price}"
-        )
-
-    return price
-
-
-def get_current_price() -> Tuple[Optional[float], str, Optional[str]]:
-    """
-    Get a live CoinGecko price, falling back to the
-    last successful price in the current session.
+    This function catches all expected request and parsing
+    failures so the Streamlit rendering layer receives a
+    predictable result instead of an uncaught exception.
     """
 
     try:
-        current_price = fetch_coingecko_btc_price()
+        response = requests.get(
+            COINGECKO_PRICE_URL,
+            params={
+                "ids": "bitcoin",
+                "vs_currencies": "usd",
+            },
+            headers={
+                "Accept": "application/json",
+                "User-Agent": (
+                    "operational-governance-engine/1.0"
+                ),
+            },
+            timeout=10,
+        )
 
+        if response.status_code != 200:
+            return (
+                None,
+                "CoinGecko HTTP status "
+                f"{response.status_code}",
+            )
+
+        try:
+            data = response.json()
+        except ValueError as exc:
+            return (
+                None,
+                f"CoinGecko returned invalid JSON: {exc}",
+            )
+
+        if not isinstance(data, dict):
+            return (
+                None,
+                "CoinGecko returned a non-object response.",
+            )
+
+        bitcoin_data = data.get("bitcoin")
+
+        if not isinstance(bitcoin_data, dict):
+            return (
+                None,
+                "CoinGecko response has no bitcoin object.",
+            )
+
+        raw_price = bitcoin_data.get("usd")
+
+        if raw_price is None:
+            return (
+                None,
+                "CoinGecko response has no bitcoin.usd value.",
+            )
+
+        price = float(raw_price)
+
+        if not np.isfinite(price) or price <= 0:
+            return (
+                None,
+                f"CoinGecko returned invalid price: {price}",
+            )
+
+        return price, None
+
+    except requests.RequestException as exc:
+        logger.warning(
+            "CoinGecko network error: %s",
+            exc,
+        )
+        return None, f"Network error: {exc}"
+
+    except (TypeError, ValueError) as exc:
+        logger.warning(
+            "CoinGecko value error: %s",
+            exc,
+        )
+        return None, f"Invalid CoinGecko data: {exc}"
+
+    except Exception as exc:
+        logger.exception(
+            "Unexpected CoinGecko error."
+        )
+        return None, f"Unexpected error: {exc}"
+
+
+def get_current_price() -> Tuple[
+    Optional[float],
+    str,
+    Optional[str],
+]:
+    """
+    Return current price, source, and timestamp/diagnostic.
+    """
+
+    price, error_message = (
+        fetch_coingecko_btc_price()
+    )
+
+    if price is not None:
         st.session_state.last_successful_price = (
-            current_price
+            price
         )
         st.session_state.last_price_timestamp = (
             utc_timestamp()
         )
         st.session_state.last_price_error = None
 
+        logger.info(
+            "CoinGecko price accepted: %.2f",
+            price,
+        )
+
         return (
-            current_price,
-            PRICE_SOURCE_LIVE,
+            price,
+            COINGECKO_SOURCE,
             None,
         )
 
-    except Exception as exc:
+    previous_price = st.session_state.get(
+        "last_successful_price"
+    )
+
+    previous_timestamp = st.session_state.get(
+        "last_price_timestamp"
+    )
+
+    st.session_state.last_price_error = (
+        error_message
+    )
+
+    if previous_price is not None:
         logger.warning(
-            "CoinGecko price request failed: %s",
-            exc,
+            "Using last successful price %.2f. "
+            "CoinGecko reason: %s",
+            previous_price,
+            error_message,
         )
 
-        previous_price = st.session_state.get(
-            "last_successful_price"
+        return (
+            float(previous_price),
+            FALLBACK_SOURCE,
+            previous_timestamp,
         )
-        previous_timestamp = st.session_state.get(
-            "last_price_timestamp"
-        )
 
-        if previous_price is not None:
-            return (
-                float(previous_price),
-                PRICE_SOURCE_FALLBACK,
-                previous_timestamp,
-            )
+    logger.error(
+        "No live or fallback price available: %s",
+        error_message,
+    )
 
-        return None, "UNAVAILABLE", str(exc)
-
-
-def append_local_audit_record(
-    record: Dict[str, Any],
-) -> None:
-    """
-    Append a UI event to a local JSONL file.
-
-    GovernanceEngine maintains the cryptographic audit
-    chain for engine events. This function records UI-level
-    events separately.
-    """
-
-    try:
-        with open(
-            AUDIT_PATH,
-            "a",
-            encoding="utf-8",
-        ) as file:
-            file.write(
-                json.dumps(
-                    record,
-                    sort_keys=True,
-                    default=str,
-                )
-                + "\n"
-            )
-
-    except OSError as exc:
-        logger.warning(
-            "Unable to append UI audit record: %s",
-            exc,
-        )
+    return (
+        None,
+        "UNAVAILABLE",
+        error_message,
+    )
 
 
 def initialize_session_state() -> None:
-    """
-    Initialize Streamlit session-state values.
-    """
-
     if "engine" not in st.session_state:
         st.session_state.engine = None
 
@@ -206,10 +241,6 @@ def initialize_session_state() -> None:
 
 
 def initialize_engine() -> GovernanceEngine:
-    """
-    Initialize GovernanceEngine exactly once per session.
-    """
-
     if st.session_state.engine is None:
         if not CSV_PATH.exists():
             raise FileNotFoundError(
@@ -235,31 +266,159 @@ def initialize_engine() -> GovernanceEngine:
     return st.session_state.engine
 
 
-def render_header(
+def append_ui_audit_record(
+    record: Dict[str, Any],
+) -> None:
+    try:
+        with open(
+            UI_AUDIT_PATH,
+            "a",
+            encoding="utf-8",
+        ) as file:
+            file.write(
+                json.dumps(
+                    record,
+                    sort_keys=True,
+                    default=str,
+                )
+                + "\n"
+            )
+
+    except OSError as exc:
+        logger.warning(
+            "Could not write UI audit record: %s",
+            exc,
+        )
+
+
+def read_engine_audit_records() -> List[
+    Dict[str, Any]
+]:
+    if not AUDIT_PATH.exists():
+        return []
+
+    records = []
+
+    try:
+        with open(
+            AUDIT_PATH,
+            "r",
+            encoding="utf-8",
+        ) as file:
+            for line in file:
+                line = line.strip()
+
+                if not line:
+                    continue
+
+                try:
+                    records.append(json.loads(line))
+                except json.JSONDecodeError:
+                    continue
+
+    except OSError as exc:
+        logger.warning(
+            "Could not read engine audit chain: %s",
+            exc,
+        )
+
+    return records
+
+
+def verify_engine_audit_chain() -> Dict[str, Any]:
+    records = read_engine_audit_records()
+
+    if not records:
+        return {
+            "valid": True,
+            "records_checked": 0,
+            "reason": "No engine audit records found.",
+        }
+
+    expected_previous_hash = "0" * 64
+
+    for index, record in enumerate(records):
+        actual_previous_hash = record.get(
+            "previous_hash"
+        )
+
+        if actual_previous_hash != (
+            expected_previous_hash
+        ):
+            return {
+                "valid": False,
+                "records_checked": index,
+                "reason": (
+                    "Previous hash mismatch at record "
+                    f"{index}."
+                ),
+            }
+
+        unsigned_record = dict(record)
+
+        actual_hash = unsigned_record.pop(
+            "current_hash",
+            None,
+        )
+
+        canonical = json.dumps(
+            unsigned_record,
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+
+        expected_hash = hashlib.sha256(
+            canonical.encode("utf-8")
+        ).hexdigest()
+
+        if actual_hash != expected_hash:
+            return {
+                "valid": False,
+                "records_checked": index + 1,
+                "reason": (
+                    "Current hash mismatch at record "
+                    f"{index}."
+                ),
+            }
+
+        expected_previous_hash = actual_hash
+
+    return {
+        "valid": True,
+        "records_checked": len(records),
+        "last_hash": expected_previous_hash,
+        "reason": "Engine audit chain verified.",
+    }
+
+
+def render_price_status(
     current_price: Optional[float],
     price_source: str,
     price_timestamp: Optional[str],
 ) -> None:
-    st.title("Operational Governance Engine")
-
-    st.caption(
-        "AI-assisted operational governance, market "
-        "monitoring, risk controls, and auditability."
-    )
-
     if current_price is None:
         st.error(
-            "No current Bitcoin price is available."
+            "No current or fallback Bitcoin price is available."
         )
+
+        error_message = (
+            st.session_state.get(
+                "last_price_error"
+            )
+            or "No price diagnostic is available."
+        )
+
+        st.code(error_message)
         return
 
-    if price_source == PRICE_SOURCE_LIVE:
+    if price_source == COINGECKO_SOURCE:
         st.success(
             f"Price Source: CoinGecko | "
             f"BTC/USD: ${current_price:,.2f}"
         )
+        return
 
-    elif price_source == PRICE_SOURCE_FALLBACK:
+    if price_source == FALLBACK_SOURCE:
         st.warning(
             f"Price Source: Last successful price | "
             f"BTC/USD: ${current_price:,.2f}"
@@ -271,19 +430,68 @@ def render_header(
                 f"{price_timestamp}"
             )
 
-    else:
-        st.error(
-            "Price source unavailable."
+        if st.session_state.get(
+            "last_price_error"
+        ):
+            st.caption(
+                "CoinGecko diagnostic: "
+                f"{st.session_state.last_price_error}"
+            )
+
+        return
+
+    st.error(
+        f"Unknown price source: {price_source}"
+    )
+
+
+def render_portfolio_metrics(
+    engine: GovernanceEngine,
+    current_price: float,
+) -> None:
+    st.subheader("Portfolio State")
+
+    cash = float(engine.cash)
+    btc_balance = float(engine.btc_balance)
+
+    portfolio_value = cash + (
+        btc_balance * current_price
+    )
+
+    col1, col2, col3 = st.columns(3)
+
+    with col1:
+        st.metric(
+            "Cash",
+            f"${cash:,.2f}",
+        )
+
+    with col2:
+        st.metric(
+            "BTC Balance",
+            f"{btc_balance:.8f}",
+        )
+
+    with col3:
+        st.metric(
+            "Portfolio Value",
+            f"${portfolio_value:,.2f}",
         )
 
 
 def render_rademacher_metrics(
     engine: GovernanceEngine,
 ) -> None:
-    estimate = engine.rademacher_estimate
-    limit = engine.rademacher_limit
-    standard_error = engine.rademacher_standard_error
+    estimate = float(
+        engine.rademacher_estimate
+    )
+    limit = float(engine.rademacher_limit)
+    standard_error = float(
+        engine.rademacher_standard_error
+    )
+
     distance = limit - estimate
+
     utilization = (
         estimate / limit
         if limit > 0
@@ -318,9 +526,15 @@ def render_rademacher_metrics(
             f"{distance:.6f}",
         )
 
-    st.progress(
-        min(max(utilization, 0.0), 1.0),
-        text=f"Utilization: {utilization:.2%}",
+    progress_value = min(
+        max(utilization, 0.0),
+        1.0,
+    )
+
+    st.progress(progress_value)
+
+    st.caption(
+        f"Utilization: {utilization:.2%}"
     )
 
     if estimate >= limit:
@@ -329,8 +543,8 @@ def render_rademacher_metrics(
         )
     else:
         st.success(
-            "Rademacher complexity is within the configured "
-            "soft limit."
+            "Rademacher complexity is within the "
+            "configured soft limit."
         )
 
 
@@ -373,7 +587,8 @@ def render_dissipativity_metrics(
         )
     elif state["utilization"] >= 0.80:
         st.warning(
-            "Dissipativity state is approaching its soft limit."
+            "Dissipativity state is approaching its "
+            "soft limit."
         )
     else:
         st.success(
@@ -382,49 +597,6 @@ def render_dissipativity_metrics(
 
     with st.expander("Dissipativity details"):
         st.json(state)
-
-
-def render_portfolio_metrics(
-    engine: GovernanceEngine,
-    current_price: Optional[float],
-) -> None:
-    st.subheader("Portfolio State")
-
-    btc_balance = float(engine.btc_balance)
-    cash = float(engine.cash)
-
-    portfolio_value = None
-
-    if current_price is not None:
-        portfolio_value = cash + (
-            btc_balance * current_price
-        )
-
-    col1, col2, col3 = st.columns(3)
-
-    with col1:
-        st.metric(
-            "Cash",
-            f"${cash:,.2f}",
-        )
-
-    with col2:
-        st.metric(
-            "BTC Balance",
-            f"{btc_balance:.8f}",
-        )
-
-    with col3:
-        if portfolio_value is None:
-            st.metric(
-                "Portfolio Value",
-                "Unavailable",
-            )
-        else:
-            st.metric(
-                "Portfolio Value",
-                f"${portfolio_value:,.2f}",
-            )
 
 
 def render_governance_summary(
@@ -453,8 +625,8 @@ def render_governance_summary(
                 "sell_pct": engine.sell_pct,
                 "buy_active": engine.buy_active,
                 "sell_active": engine.sell_active,
-                "initial_cash": engine.cash,
-                "initial_btc": engine.btc_balance,
+                "cash": engine.cash,
+                "btc_balance": engine.btc_balance,
             }
         )
 
@@ -503,7 +675,9 @@ def render_admissibility_controls(
         try:
             result = engine.admissibility_check(
                 current_price=current_price,
-                proposed_order_qty=proposed_order_qty,
+                proposed_order_qty=(
+                    proposed_order_qty
+                ),
                 action="execute_spot_trade",
                 risk_tier=risk_tier,
                 stress_profile=stress_profile,
@@ -513,10 +687,12 @@ def render_admissibility_controls(
                 result
             )
 
-            append_local_audit_record(
+            append_ui_audit_record(
                 {
                     "timestamp": utc_timestamp(),
-                    "event_type": "UI_ADMISSIBILITY_CHECK",
+                    "event_type": (
+                        "UI_ADMISSIBILITY_CHECK"
+                    ),
                     "source": price_source,
                     "symbol": PRICE_SYMBOL,
                     "price": current_price,
@@ -577,19 +753,14 @@ def render_strategy_controls(
         key="strategy_stress_profile",
     )
 
-    st.caption(
-        "Automated execution is permitted only when a live "
-        "CoinGecko price is available."
-    )
-
     if st.button(
         "Run automated strategy tick",
         key="run_strategy_tick",
     ):
-        if price_source != PRICE_SOURCE_LIVE:
+        if price_source != COINGECKO_SOURCE:
             st.error(
-                "Automated strategy execution is blocked "
-                "because the current price is not live."
+                "Automated execution is blocked because "
+                "the current price is not live."
             )
             return
 
@@ -608,7 +779,7 @@ def render_strategy_controls(
                 result
             )
 
-            append_local_audit_record(
+            append_ui_audit_record(
                 {
                     "timestamp": utc_timestamp(),
                     "event_type": (
@@ -704,3 +875,282 @@ def render_limit_controls(
             step=1.0,
             format="%.2f",
         )
+
+        new_buy_active = st.checkbox(
+            "Buy active",
+            value=bool(engine.buy_active),
+        )
+
+        new_sell_active = st.checkbox(
+            "Sell active",
+            value=bool(engine.sell_active),
+        )
+
+        submitted = st.form_submit_button(
+            "Apply administrative limits"
+        )
+
+    if submitted:
+        try:
+            engine.update_limits(
+                {
+                    "rademacher_limit": (
+                        new_rademacher_limit
+                    ),
+                    "dissipativity_soft_limit": (
+                        new_dissipativity_limit
+                    ),
+                    "max_buy_price": (
+                        new_max_buy_price
+                    ),
+                    "buy_cash_pct": (
+                        new_buy_cash_pct
+                    ),
+                    "min_sell_price": (
+                        new_min_sell_price
+                    ),
+                    "sell_pct": new_sell_pct,
+                    "buy_active": new_buy_active,
+                    "sell_active": new_sell_active,
+                }
+            )
+
+            append_ui_audit_record(
+                {
+                    "timestamp": utc_timestamp(),
+                    "event_type": (
+                        "UI_ADMINISTRATIVE_LIMIT_UPDATE"
+                    ),
+                    "new_limits": {
+                        "rademacher_limit": (
+                            new_rademacher_limit
+                        ),
+                        "dissipativity_soft_limit": (
+                            new_dissipativity_limit
+                        ),
+                        "max_buy_price": (
+                            new_max_buy_price
+                        ),
+                        "buy_cash_pct": (
+                            new_buy_cash_pct
+                        ),
+                        "min_sell_price": (
+                            new_min_sell_price
+                        ),
+                        "sell_pct": new_sell_pct,
+                        "buy_active": new_buy_active,
+                        "sell_active": new_sell_active,
+                    },
+                }
+            )
+
+            st.success(
+                "Administrative limits updated."
+            )
+
+        except Exception as exc:
+            st.error(
+                "Administrative limit update failed."
+            )
+            st.exception(exc)
+
+
+def render_replay_controls(
+    engine: GovernanceEngine,
+) -> None:
+    st.subheader("Historical Replay")
+
+    replay_profile = st.selectbox(
+        "Replay stress profile",
+        options=[
+            "Nominal",
+            "High Volatility",
+            "Liquidity Crunch",
+            "Adverse Drawdown",
+        ],
+        key="replay_profile",
+    )
+
+    if st.button(
+        "Run Step 2 replay",
+        key="run_step_2_replay",
+    ):
+        try:
+            result = engine.run_step_2_replay(
+                profile=replay_profile,
+                duration="3 Years",
+            )
+
+            st.session_state.last_replay_result = (
+                result
+            )
+
+            append_ui_audit_record(
+                {
+                    "timestamp": utc_timestamp(),
+                    "event_type": "UI_STEP_2_REPLAY",
+                    "profile": replay_profile,
+                    "duration": "3 Years",
+                    "result": result,
+                }
+            )
+
+        except Exception as exc:
+            st.error(
+                "Historical replay failed."
+            )
+            st.exception(exc)
+
+    result = st.session_state.last_replay_result
+
+    if result is not None:
+        st.json(result)
+
+
+def render_audit_trail() -> None:
+    st.subheader("Audit Trail")
+
+    verification = verify_engine_audit_chain()
+
+    if verification["valid"]:
+        st.success(
+            verification["reason"]
+        )
+    else:
+        st.error(
+            verification["reason"]
+        )
+
+    st.json(verification)
+
+    records = read_engine_audit_records()
+
+    if records:
+        st.dataframe(
+            pd.DataFrame(records),
+            use_container_width=True,
+        )
+    else:
+        st.info(
+            "No engine audit records found yet."
+        )
+
+    if UI_AUDIT_PATH.exists():
+        st.subheader("UI Audit Events")
+
+        try:
+            ui_records = []
+
+            with open(
+                UI_AUDIT_PATH,
+                "r",
+                encoding="utf-8",
+            ) as file:
+                for line in file:
+                    line = line.strip()
+
+                    if not line:
+                        continue
+
+                    try:
+                        ui_records.append(
+                            json.loads(line)
+                        )
+                    except json.JSONDecodeError:
+                        continue
+
+            if ui_records:
+                st.dataframe(
+                    pd.DataFrame(ui_records),
+                    use_container_width=True,
+                )
+
+        except OSError as exc:
+            st.warning(
+                f"Unable to read UI audit events: {exc}"
+            )
+
+
+def main() -> None:
+    st.set_page_config(
+        page_title="Operational Governance Engine",
+        page_icon="₿",
+        layout="wide",
+    )
+
+    st.title("Operational Governance Engine")
+    st.caption(APP_BOOT_MARKER)
+
+    initialize_session_state()
+
+    try:
+        engine = initialize_engine()
+    except Exception as exc:
+        st.error(
+            "GovernanceEngine initialization failed."
+        )
+        st.exception(exc)
+        st.stop()
+
+    current_price, price_source, price_timestamp = (
+        get_current_price()
+    )
+
+    render_price_status(
+        current_price=current_price,
+        price_source=price_source,
+        price_timestamp=price_timestamp,
+    )
+
+    if current_price is None:
+        st.stop()
+
+    render_portfolio_metrics(
+        engine=engine,
+        current_price=current_price,
+    )
+
+    tab_dashboard, tab_controls, tab_replay, tab_audit = (
+        st.tabs(
+            [
+                "Dashboard",
+                "Controls",
+                "Replay",
+                "Audit Trail",
+            ]
+        )
+    )
+
+    with tab_dashboard:
+        render_rademacher_metrics(engine)
+        render_dissipativity_metrics(engine)
+        render_governance_summary(engine)
+
+    with tab_controls:
+        render_admissibility_controls(
+            engine=engine,
+            current_price=current_price,
+            price_source=price_source,
+        )
+
+        st.divider()
+
+        render_strategy_controls(
+            engine=engine,
+            current_price=current_price,
+            price_source=price_source,
+        )
+
+        st.divider()
+
+        render_limit_controls(engine)
+
+    with tab_replay:
+        render_replay_controls(engine)
+
+    with tab_audit:
+        render_audit_trail()
+
+
+if __name__ == "__main__":
+    main()
